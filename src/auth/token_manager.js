@@ -496,6 +496,18 @@ class TokenManager {
       tokenCounts: Object.fromEntries(this.tokenRequestCounts)
     };
   }
+
+  // 强制切换到下一个 Token（用于 429 重试）
+  forceRotate() {
+    if (this.tokens.length <= 1) {
+      log.warn('只有 1 个 Token，无法切换');
+      return false;
+    }
+    const oldIndex = this.currentIndex;
+    this.currentIndex = (this.currentIndex + 1) % this.tokens.length;
+    log.info(`强制切换 Token: 索引 ${oldIndex} -> ${this.currentIndex}`);
+    return true;
+  }
 }
 
 // 导出策略枚举

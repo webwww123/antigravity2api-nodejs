@@ -62,26 +62,43 @@ logger.info(`静态文件目录: ${getRelativePath(publicDir)}`);
 
 const app = express();
 
-// ==================== 通用重试工具（处理 429） ====================
-const with429Retry = async (fn, maxRetries, loggerPrefix = '') => {
+// ==================== 通用重试工具（处理 429 和 404） ====================
+const withRetry = async (fn, maxRetries, loggerPrefix = '') => {
   const retries = Number.isFinite(maxRetries) && maxRetries > 0 ? Math.floor(maxRetries) : 0;
   let attempt = 0;
-  // 首次执行 + 最多 retries 次重试
+
   while (true) {
     try {
       return await fn(attempt);
     } catch (error) {
       const status = Number(error.status || error.response?.status);
+
+      // 429: 速率限制 - 切换 Token 后重试
       if (status === 429 && attempt < retries) {
         const nextAttempt = attempt + 1;
-        logger.warn(`${loggerPrefix}收到 429，正在进行第 ${nextAttempt} 次重试（共 ${retries} 次）`);
+        logger.warn(`${loggerPrefix}收到 429，切换 Token 后进行第 ${nextAttempt} 次重试（共 ${retries} 次）`);
+        tokenManager.forceRotate();
         attempt = nextAttempt;
         continue;
       }
+
+      // 404: 资源未找到 - 等待后重试（可能是临时问题）
+      if (status === 404 && attempt < retries) {
+        const nextAttempt = attempt + 1;
+        const delay = 1000 * nextAttempt; // 递增延迟：1s, 2s, 3s...
+        logger.warn(`${loggerPrefix}收到 404，等待 ${delay}ms 后进行第 ${nextAttempt} 次重试（共 ${retries} 次）`);
+        await new Promise(r => setTimeout(r, delay));
+        attempt = nextAttempt;
+        continue;
+      }
+
       throw error;
     }
   }
 };
+
+// 兼容旧名称
+const with429Retry = withRetry;
 
 // ==================== 心跳机制（防止 CF 超时） ====================
 const HEARTBEAT_INTERVAL = config.server.heartbeatInterval || 15000; // 从配置读取心跳间隔
@@ -96,11 +113,11 @@ const createHeartbeat = (res) => {
       clearInterval(timer);
     }
   }, HEARTBEAT_INTERVAL);
-  
+
   // 响应结束时清理
   res.on('close', () => clearInterval(timer));
   res.on('finish', () => clearInterval(timer));
-  
+
   return timer;
 };
 
@@ -153,10 +170,10 @@ const createStreamChunk = (id, created, model, delta, finish_reason = null) => {
 const writeStreamData = (res, data) => {
   const json = JSON.stringify(data);
   // 释放对象回池
-                const delta = { reasoning_content: data.reasoning_content };
-                if (data.thoughtSignature) {
-                  delta.thoughtSignature = data.thoughtSignature;
-                }
+  const delta = { reasoning_content: data.reasoning_content };
+  if (data.thoughtSignature) {
+    delta.thoughtSignature = data.thoughtSignature;
+  }
   res.write(SSE_PREFIX);
   res.write(json);
   res.write(SSE_SUFFIX);
@@ -279,7 +296,7 @@ app.get('/health', (req, res) => {
 
 
 app.post('/v1/chat/completions', async (req, res) => {
-  const { messages, model, stream = false, tools, ...params} = req.body;
+  const { messages, model, stream = false, tools, ...params } = req.body;
   try {
     if (!messages) {
       return res.status(400).json({ error: 'messages is required' });
@@ -294,14 +311,14 @@ app.post('/v1/chat/completions', async (req, res) => {
       prepareImageRequest(requestBody);
     }
     //console.log(JSON.stringify(requestBody,null,2))
-    
+
     const { id, created } = createResponseMeta();
     const maxRetries = Number(config.retryTimes || 0);
     const safeRetries = maxRetries > 0 ? Math.floor(maxRetries) : 0;
-    
+
     if (stream) {
       setStreamHeaders(res);
-      
+
       // 启动心跳，防止 Cloudflare 超时断连
       const heartbeatTimer = createHeartbeat(res);
 
@@ -355,7 +372,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       // 非流式请求：设置较长超时，避免大模型响应超时
       req.setTimeout(0); // 禁用请求超时
       res.setTimeout(0); // 禁用响应超时
-      
+
       const { content, reasoningContent, reasoningSignature, toolCalls, usage } = await with429Retry(
         () => generateAssistantResponseNoStream(requestBody, token),
         safeRetries,
@@ -367,7 +384,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       if (reasoningSignature) message.thoughtSignature = reasoningSignature;
       message.content = content;
       if (toolCalls.length > 0) message.tool_calls = toolCalls;
-      
+
       // 使用预构建的响应对象，减少内存分配
       const response = {
         id,
@@ -381,7 +398,7 @@ app.post('/v1/chat/completions', async (req, res) => {
         }],
         usage
       };
-      
+
       res.json(response);
     }
   } catch (error) {
@@ -417,24 +434,24 @@ server.on('error', (error) => {
 
 const shutdown = () => {
   logger.info('正在关闭服务器...');
-  
+
   // 停止内存管理器
   memoryManager.stop();
   logger.info('已停止内存管理器');
-  
+
   // 关闭子进程请求器
   closeRequester();
   logger.info('已关闭子进程请求器');
-  
+
   // 清理对象池
   chunkPool.length = 0;
   logger.info('已清理对象池');
-  
+
   server.close(() => {
     logger.info('服务器已关闭');
     process.exit(0);
   });
-  
+
   // 5秒超时强制退出
   setTimeout(() => {
     logger.warn('服务器关闭超时，强制退出');
