@@ -93,7 +93,7 @@ jobs:
         with:
           name: ${{ matrix.artifact_name }}
           path: ${{ matrix.asset_name }}
-          retention-days: 30
+          retention-days: 3
           compression-level: 0
 
   release:
